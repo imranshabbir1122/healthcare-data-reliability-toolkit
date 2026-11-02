@@ -2,21 +2,30 @@
 
 All data here is invented. It contains no real patients or organizations.
 """
+import os
 import random
 import sqlite3
 import sys
 
-random.seed(42)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from toolkit.dialect import placeholders  # noqa: E402
 
 
 def build(path: str = "sample.db") -> None:
     conn = sqlite3.connect(path)
+    build_into(conn)
+    conn.close()
+
+
+def build_into(conn) -> None:
+    """Create and fill the synthetic tables on any DB-API connection (SQLite, PostgreSQL)."""
+    random.seed(42)
     cur = conn.cursor()
     for t in ("src_encounters", "tgt_encounters"):
         cur.execute(f"DROP TABLE IF EXISTS {t}")
         cur.execute(f"""CREATE TABLE {t} (
-            encounter_id INTEGER, facility_code TEXT, encounter_date TEXT,
-            charge_amount REAL, status TEXT, updated_at TEXT)""")
+            encounter_id INTEGER, facility_code VARCHAR(10), encounter_date VARCHAR(10),
+            charge_amount NUMERIC(12,2), status VARCHAR(10), updated_at VARCHAR(10))""")
     facilities = ["F01", "F02", "F03"]
     statuses = ["OPEN", "CLOSED", "BILLED"]
     rows = []
@@ -24,7 +33,8 @@ def build(path: str = "sample.db") -> None:
         rows.append((i, random.choice(facilities), f"2026-{random.randint(1, 9):02d}-{random.randint(1, 28):02d}",
                      round(random.uniform(50, 2500), 2), random.choice(statuses),
                      f"2026-10-{random.randint(1, 28):02d}"))
-    cur.executemany("INSERT INTO src_encounters VALUES (?,?,?,?,?,?)", rows)
+    marks = ",".join(placeholders(conn, 6))
+    cur.executemany(f"INSERT INTO src_encounters VALUES ({marks})", rows)
 
     tgt = [list(r) for r in rows]
     # deliberate problems
@@ -35,9 +45,9 @@ def build(path: str = "sample.db") -> None:
     tgt[40][4] = None                                             # null status
     tgt[60][3] = round(tgt[60][3] + 25.0, 2)                      # changed amount
     tgt[80][3] = round(tgt[80][3] - 10.5, 2)                      # changed amount
-    cur.executemany("INSERT INTO tgt_encounters VALUES (?,?,?,?,?,?)", [tuple(r) for r in tgt])
+    cur.executemany(f"INSERT INTO tgt_encounters VALUES ({marks})", [tuple(r) for r in tgt])
     conn.commit()
-    conn.close()
+    cur.close()
 
 
 if __name__ == "__main__":

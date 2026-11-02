@@ -11,6 +11,17 @@ Checks performed
   5. null_count:<col>     null counts per compared column
   6. sum:<col>            totals of numeric columns (business-level aggregates)
   7. row_hash_mismatch    rows whose key matches but whose values differ
+  8. null_keys:<side>     rows with a NULL in any key column (cannot be matched)
+
+Edge cases handled (v0.2.0)
+  * NULL keys are reported separately and excluded from missing/extra checks,
+    because NULL never equals NULL in a SQL join.
+  * Duplicate keys are reported, and are skipped in the row-level comparison
+    so one duplicate does not hide or inflate value differences.
+  * Numeric totals are compared with a tolerance (default 0.005), not exactly.
+  * Row hashes normalize numbers (1, 1.0 and 1.000000 hash the same) and,
+    optionally, text case and surrounding whitespace.
+  * Empty tables are valid input.
 
 Notes for adapting to other databases
   * Table and column names are validated, then interpolated into SQL.
@@ -21,11 +32,14 @@ Notes for adapting to other databases
 from __future__ import annotations
 
 import hashlib
+import numbers
 import re
 import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Iterable, Sequence
+
+from .dialect import execute, table_exists
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
 
@@ -68,8 +82,19 @@ def _result(check, source_value, target_value, detail=""):
     return CheckResult(check, status, str(source_value), str(target_value), detail)
 
 
-def _row_hash(values: Iterable) -> str:
-    text = "\x1f".join("" if v is None else str(v) for v in values)
+def _norm(v, normalize_text: bool = False) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return str(int(v))
+    if isinstance(v, numbers.Number):          # int, float, Decimal
+        return format(round(float(v), 6), ".6f")
+    text = str(v)
+    return text.strip().lower() if normalize_text else text
+
+
+def _row_hash(values: Iterable, normalize_text: bool = False) -> str:
+    text = "\x1f".join(_norm(v, normalize_text) for v in values)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -81,6 +106,8 @@ def reconcile(
     compare_cols: Sequence[str],
     numeric_cols: Sequence[str] = (),
     max_detail_rows: int = 5,
+    tolerance: float = 0.005,
+    normalize_text: bool = False,
 ) -> list[CheckResult]:
     """Run all checks and return a list of CheckResult."""
     s, t = _ident(source), _ident(target)
@@ -107,13 +134,20 @@ def reconcile(
             f"examples: {[tuple(r[:-1]) for r in dups[:max_detail_rows]]}" if dups else "",
         ))
 
-    # 3 and 4. keys missing or extra
+    # 2b. NULL keys cannot be matched, so report them on their own
+    any_null = lambda alias: " OR ".join(f"{alias}{k} IS NULL" for k in keys)
+    all_set = lambda alias: " AND ".join(f"{alias}{k} IS NOT NULL" for k in keys)
+    for label, tbl in (("source", s), ("target", t)):
+        n = _scalar(conn, f"SELECT COUNT(*) FROM {tbl} WHERE {any_null('')}")
+        results.append(CheckResult(f"null_keys:{label}", PASS if n == 0 else FAIL, "0", str(n)))
+
+    # 3 and 4. keys missing or extra (rows with NULL keys are excluded)
     join_on = " AND ".join(f"a.{k} = b.{k}" for k in keys)
     first = keys[0]
     missing = _rows(conn, f"SELECT {', '.join('a.' + k for k in keys)} FROM {s} a "
-                          f"LEFT JOIN {t} b ON {join_on} WHERE b.{first} IS NULL")
+                          f"LEFT JOIN {t} b ON {join_on} WHERE b.{first} IS NULL AND {all_set('a.')}")
     extra = _rows(conn, f"SELECT {', '.join('b.' + k for k in keys)} FROM {t} b "
-                        f"LEFT JOIN {s} a ON {join_on} WHERE a.{first} IS NULL")
+                        f"LEFT JOIN {s} a ON {join_on} WHERE a.{first} IS NULL AND {all_set('b.')}")
     results.append(CheckResult(
         "missing_in_target", PASS if not missing else FAIL, "0", str(len(missing)),
         f"examples: {[tuple(r) for r in missing[:max_detail_rows]]}" if missing else ""))
@@ -133,19 +167,38 @@ def reconcile(
     for c in nums:
         sv = _scalar(conn, f"SELECT COALESCE(SUM({c}), 0) FROM {s}")
         tv = _scalar(conn, f"SELECT COALESCE(SUM({c}), 0) FROM {t}")
-        results.append(_result(f"sum:{c}", round(float(sv), 2), round(float(tv), 2)))
+        sv, tv = float(sv), float(tv)
+        ok = abs(sv - tv) <= tolerance
+        results.append(CheckResult(f"sum:{c}", PASS if ok else FAIL, f"{sv:.2f}", f"{tv:.2f}",
+                                   "" if ok else f"difference={tv - sv:.2f}"))
 
-    # 7. row-level hash on matching keys
+    # 7. row-level hash on matching keys (keys duplicated on either side are skipped)
     sel = ", ".join(keys + cols)
-    src = {tuple(r[: len(keys)]): _row_hash(r[len(keys):]) for r in _rows(conn, f"SELECT {sel} FROM {s}")}
-    mismatched = []
+    nk = len(keys)
+    src_rows, dup_src = {}, set()
+    for r in _rows(conn, f"SELECT {sel} FROM {s}"):
+        k = tuple(r[:nk])
+        if None in k:
+            continue
+        if k in src_rows:
+            dup_src.add(k)
+        src_rows[k] = _row_hash(r[nk:], normalize_text)
+    tgt_seen, dup_tgt, mismatched = {}, set(), []
     for r in _rows(conn, f"SELECT {sel} FROM {t}"):
-        k = tuple(r[: len(keys)])
-        if k in src and src[k] != _row_hash(r[len(keys):]):
+        k = tuple(r[:nk])
+        if None in k:
+            continue
+        if k in tgt_seen:
+            dup_tgt.add(k)
+        tgt_seen[k] = _row_hash(r[nk:], normalize_text)
+    for k, h in tgt_seen.items():
+        if k in src_rows and k not in dup_src and k not in dup_tgt and src_rows[k] != h:
             mismatched.append(k)
+    skipped = len(dup_src | dup_tgt)
+    note = f"; {skipped} duplicate key(s) skipped" if skipped else ""
     results.append(CheckResult(
         "row_hash_mismatch", PASS if not mismatched else FAIL, "0", str(len(mismatched)),
-        f"examples: {mismatched[:max_detail_rows]}" if mismatched else ""))
+        (f"examples: {mismatched[:max_detail_rows]}" if mismatched else "") + note))
     return results
 
 
@@ -155,15 +208,20 @@ def write_results(conn, results: Sequence[CheckResult], source: str, target: str
     _ident(table)
     run_id = run_id or uuid.uuid4().hex[:12]
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if not table_exists(conn, table):
+        cur = conn.cursor()
+        cur.execute(f"""CREATE TABLE {table} (
+            run_id VARCHAR(64), run_ts VARCHAR(40), source_table VARCHAR(255), target_table VARCHAR(255),
+            check_name VARCHAR(255), status VARCHAR(16), source_value VARCHAR(255),
+            target_value VARCHAR(255), detail VARCHAR(4000))""")
+        conn.commit()
+        cur.close()
     cur = conn.cursor()
-    cur.execute(f"""CREATE TABLE IF NOT EXISTS {table} (
-        run_id TEXT, run_ts TEXT, source_table TEXT, target_table TEXT,
-        check_name TEXT, status TEXT, source_value TEXT, target_value TEXT, detail TEXT)""")
     for r in results:
-        cur.execute(
-            f"INSERT INTO {table} VALUES (?,?,?,?,?,?,?,?,?)",
-            (run_id, now, source, target, r.check, r.status, r.source_value, r.target_value, r.detail),
-        )
+        execute(cur, conn, f"INSERT INTO {table} (run_id, run_ts, source_table, target_table, check_name, "
+                           "status, source_value, target_value, detail) VALUES (?,?,?,?,?,?,?,?,?)",
+                (run_id, now, source, target, r.check, r.status, r.source_value, r.target_value,
+                 (r.detail or "")[:4000]))
     conn.commit()
     cur.close()
     return run_id
