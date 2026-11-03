@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.1
+- Docs: clarified that quarantine is a reference-design pattern and is not implemented by the toolkit.
+
 ## 0.3.0
 - `rules.unique`: defined NULL behavior for single and composite keys. `null_policy="ignore"` (default; rows with any NULL are not duplicates, as in the SQL standard, PostgreSQL and SQLite) or `"strict"` (NULLs equal, as in a SQL Server UNIQUE constraint). Check names now include the policy. Tested.
 - `check_incremental`: always returns the same set of checks. With an empty target it now reports pending source rows and null timestamps, like a loaded target does.
