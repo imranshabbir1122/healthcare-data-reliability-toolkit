@@ -1,4 +1,4 @@
-# Healthcare Data Reliability Toolkit (v0.3.0)
+# Healthcare Data Reliability Toolkit (v0.3.1)
 
 An open, vendor-neutral set of templates for checking that data arrives complete, consistent and traceable after it is moved or transformed. It is aimed at small, rural and community healthcare organizations that receive standardized data but may not have a large in-house data-engineering team.
 
