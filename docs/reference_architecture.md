@@ -19,12 +19,14 @@ flowchart LR
     F -. lineage .-> L
 ```
 
+> The quarantine path is a reference design. This toolkit does not move or store failing records; implement it in your own pipeline.
+
 | Layer | Purpose | Toolkit component |
 |---|---|---|
 | Ingestion | Move data from sources; full and incremental loads | `check_incremental` (watermark safety checks), `sql/06_incremental_watermark.sql` |
 | Raw / landing | Keep an unchanged copy so any result can be traced back | `reconcile` (source vs landing counts, keys, totals) |
 | Validation gate | Decide whether a batch may move forward | `rules` (integrity), `reconcile` (completeness, value differences) |
-| Quarantine | Hold failing records with the reason | `write_results` (audit table) |
+| Quarantine | Hold failing records with the reason | Not implemented. This toolkit is a design pattern only. `write_results` records check results, not the failing rows. |
 | Validated / curated | Standardized, approved datasets | `reconcile` (landing vs curated), agreed definitions |
 | Lineage and audit | Record what moved, when, by which rule | `LineageLog`, `sql/07_audit_and_lineage_tables.sql` |
 
